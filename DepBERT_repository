@@ -1,0 +1,364 @@
+# ==============================================================================
+# README.md
+# ==============================================================================
+"""
+# DepBERT: Context-dependent Features Fusion with BERT
+
+This repository contains the Python implementation of the DepBERT model, as described in the paper "Context-dependent Features Fusion with BERT for Evaluating Multi-Turn Customer-Helpdesk Dialogues" by Siu Hin Ng, et al.
+
+## Project Structure
+
+```
+depbert/
+|-- README.md
+|-- requirements.txt
+|-- data/
+|   |-- sample_data.csv  # Sample data for demonstration
+|-- src/
+|   |-- __init__.py
+|   |-- preprocess.py    # Data preprocessing script
+|   |-- model.py         # DepBERT model architecture
+|   |-- main.py          # Main script for training and evaluation
+```
+
+## Setup
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository_url>
+    cd depbert
+    ```
+
+2.  **Create a virtual environment and install dependencies:**
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+    pip install -r requirements.txt
+    ```
+3.  **Download Spacy model for dependency parsing:**
+    ```bash
+    python -m spacy download en_core_web_sm
+    ```
+
+## Usage
+
+1.  **Prepare your data:**
+    Place your training and testing data in the `data/` directory. The data should be in a CSV format with 'text' and 'label' columns.
+
+2.  **Run the main script:**
+    ```bash
+    python src/main.py
+    ```
+"""
+
+# ==============================================================================
+# requirements.txt
+# ==============================================================================
+"""
+torch
+transformers
+spacy
+pandas
+scikit-learn
+numpy
+"""
+
+# ==============================================================================
+# data/sample_data.csv
+# ==============================================================================
+"""
+text,label
+"My phone is not working.","TGR"
+"Hello, how can I help you?","RGH"
+"I dropped it in water.","RGC"
+"Try putting it in rice.","SOL"
+"Okay, I will try that.","CFM"
+"It did not work.","IRC"
+"Sorry to hear that.","IRH"
+"""
+
+# ==============================================================================
+# src/__init__.py
+# ==============================================================================
+# This file can be empty.
+
+# ==============================================================================
+# src/preprocess.py
+# ==============================================================================
+import pandas as pd
+import spacy
+import numpy as np
+from transformers import BertTokenizer
+
+class Preprocessor:
+    """
+    Handles data loading, dependency parsing, and feature creation.
+    """
+    def __init__(self, model_name='bert-base-uncased', max_len=128):
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.nlp = spacy.load("en_core_web_sm")
+        self.max_len = max_len
+        self.dep_tags = self._get_dep_tags()
+
+    def _get_dep_tags(self):
+        """Gets all possible dependency tags from SpaCy."""
+        return list(self.nlp.get_pipe("parser").labels)
+
+    def load_data(self, file_path):
+        """Loads data from a CSV file."""
+        return pd.read_csv(file_path)
+
+    def get_dependency_features(self, text):
+        """
+        Extracts dependency features from a given text.
+        Returns a co-occurrence matrix and a label encoding matrix.
+        """
+        doc = self.nlp(text)
+        dep_map_co_occurrence = np.zeros((self.max_len, self.max_len), dtype=int)
+        dep_map_label = np.zeros((self.max_len, self.max_len), dtype=int)
+        
+        dep_tag_to_id = {tag: i + 1 for i, tag in enumerate(self.dep_tags)}
+
+        for token in doc:
+            if token.i < self.max_len and token.head.i < self.max_len:
+                # Co-occurrence
+                dep_map_co_occurrence[token.i, token.head.i] = 1
+                dep_map_co_occurrence[token.head.i, token.i] = 1
+                
+                # Label Encoding
+                dep_id = dep_tag_to_id.get(token.dep_, 0)
+                dep_map_label[token.i, token.head.i] = dep_id
+
+        return dep_map_co_occurrence, dep_map_label
+
+    def encode_text(self, text):
+        """Encodes text using BERT tokenizer."""
+        return self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+# ==============================================================================
+# src/model.py
+# ==============================================================================
+import torch
+import torch.nn as nn
+from transformers import BertModel
+
+class DepBERT(nn.Module):
+    """
+    DepBERT model architecture.
+    Combines BERT with a CNN for processing dependency features.
+    """
+    def __init__(self, n_classes, bert_model_name='bert-base-uncased'):
+        super(DepBERT, self).__init__()
+        self.bert = BertModel.from_pretrained(bert_model_name)
+        
+        # CNN for dependency features
+        self.conv1 = nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # The input size to the fully connected layer will depend on the max_len
+        # For max_len=128, after one pool layer, it becomes 64x64.
+        # 16 * 64 * 64 = 65536
+        self.fc_dep = nn.Linear(16 * 64 * 64, 128)
+
+        # Classifier
+        self.classifier = nn.Linear(self.bert.config.hidden_size + 128, n_classes)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, input_ids, attention_mask, dep_features):
+        # BERT forward pass
+        bert_output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        pooled_output = bert_output.pooler_output
+
+        # CNN for dependency features
+        # dep_features shape: [batch_size, 2, max_len, max_len]
+        dep_output = self.pool(self.relu(self.conv1(dep_features)))
+        dep_output = dep_output.view(dep_output.size(0), -1) # Flatten
+        dep_output = self.relu(self.fc_dep(dep_output))
+
+        # Concatenate BERT output and dependency features
+        combined_output = torch.cat((pooled_output, dep_output), dim=1)
+
+        # Classification
+        logits = self.classifier(combined_output)
+        return self.softmax(logits)
+
+# ==============================================================================
+# src/main.py
+# ==============================================================================
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, accuracy_score
+from .preprocess import Preprocessor
+from .model import DepBERT
+import pandas as pd
+import numpy as np
+
+# --- Configuration ---
+DATA_PATH = "data/sample_data.csv"
+MODEL_NAME = 'bert-base-uncased'
+MAX_LEN = 128
+BATCH_SIZE = 4
+EPOCHS = 3
+N_CLASSES = 7 # TGR, RGH, RGC, SOL, CFM, IRC, IRH
+LEARNING_RATE = 2e-5
+
+# --- Custom Dataset ---
+class DialogueDataset(Dataset):
+    def __init__(self, texts, labels, preprocessor):
+        self.texts = texts
+        self.labels = labels
+        self.preprocessor = preprocessor
+        self.label_map = {label: i for i, label in enumerate(np.unique(labels))}
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, item):
+        text = str(self.texts[item])
+        label = self.labels[item]
+
+        encoding = self.preprocessor.encode_text(text)
+        dep_co_occurrence, dep_label = self.preprocessor.get_dependency_features(text)
+        
+        dep_features = np.stack([dep_co_occurrence, dep_label])
+
+        return {
+            'text': text,
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'dep_features': torch.tensor(dep_features, dtype=torch.float32),
+            'labels': torch.tensor(self.label_map[label], dtype=torch.long)
+        }
+
+# --- Training and Evaluation Functions ---
+def train_epoch(model, data_loader, loss_fn, optimizer, device):
+    model = model.train()
+    losses = []
+    correct_predictions = 0
+
+    for d in data_loader:
+        input_ids = d["input_ids"].to(device)
+        attention_mask = d["attention_mask"].to(device)
+        dep_features = d["dep_features"].to(device)
+        labels = d["labels"].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            dep_features=dep_features
+        )
+
+        _, preds = torch.max(outputs, dim=1)
+        loss = loss_fn(outputs, labels)
+
+        correct_predictions += torch.sum(preds == labels)
+        losses.append(loss.item())
+
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return correct_predictions.double() / len(data_loader.dataset), np.mean(losses)
+
+def eval_model(model, data_loader, loss_fn, device):
+    model = model.eval()
+    losses = []
+    correct_predictions = 0
+    
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for d in data_loader:
+            input_ids = d["input_ids"].to(device)
+            attention_mask = d["attention_mask"].to(device)
+            dep_features = d["dep_features"].to(device)
+            labels = d["labels"].to(device)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                dep_features=dep_features
+            )
+
+            _, preds = torch.max(outputs, dim=1)
+            loss = loss_fn(outputs, labels)
+
+            correct_predictions += torch.sum(preds == labels)
+            losses.append(loss.item())
+            
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+
+    accuracy = correct_predictions.double() / len(data_loader.dataset)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    return accuracy, np.mean(losses), f1
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    preprocessor = Preprocessor(model_name=MODEL_NAME, max_len=MAX_LEN)
+    df = preprocessor.load_data(DATA_PATH)
+
+    # For demonstration, we'll use the same data for train and test
+    df_train, df_test = train_test_split(df, test_size=0.2, random_state=42)
+
+    train_dataset = DialogueDataset(
+        texts=df_train.text.to_numpy(),
+        labels=df_train.label.to_numpy(),
+        preprocessor=preprocessor
+    )
+    
+    test_dataset = DialogueDataset(
+        texts=df_test.text.to_numpy(),
+        labels=df_test.label.to_numpy(),
+        preprocessor=preprocessor
+    )
+
+    train_data_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_data_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DepBERT(n_classes=N_CLASSES).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    loss_fn = torch.nn.CrossEntropyLoss().to(device)
+
+    for epoch in range(EPOCHS):
+        print(f'Epoch {epoch + 1}/{EPOCHS}')
+        print('-' * 10)
+
+        train_acc, train_loss = train_epoch(
+            model,
+            train_data_loader,
+            loss_fn,
+            optimizer,
+            device
+        )
+        print(f'Train loss {train_loss} accuracy {train_acc}')
+
+        val_acc, val_loss, val_f1 = eval_model(
+            model,
+            test_data_loader,
+            loss_fn,
+            device
+        )
+        print(f'Val loss {val_loss} accuracy {val_acc} F1-score {val_f1}')
+        print()
+
+    print("Training complete.")
+
+
